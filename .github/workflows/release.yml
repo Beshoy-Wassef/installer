@@ -1,0 +1,253 @@
+name: Release
+
+# Builds TimeStack for Mac and Windows from its private source (Beshoy-Wassef/TimeStack),
+# signs the Mac app with the Developer ID certificate and has Apple notarize it, and posts both
+# here as a GitHub Release. Installed apps read the newest release to update themselves:
+# Windows reads latest.yml, the Mac reads latest-mac.yml.
+#
+# Run it from the Actions tab (Release, then Run workflow). It builds the version in the
+# source's timestack-desktop/package.json unless you type another one. Pushing a tag like
+# v0.1.38 runs it too.
+#
+# Secrets (Settings > Secrets and variables > Actions):
+# - SOURCE_TOKEN: a fine-grained token that can read Beshoy-Wassef/TimeStack's contents.
+# - TIMESTACK_ENV_LOCAL: the whole timestack-app/.env.local, built into both apps. Without it
+#   the apps run in local mode (no accounts, Google sync, Claude or analytics).
+# - MAC_CERTIFICATE: the Developer ID Application certificate and its key, as a base64 .p12.
+# - MAC_CERTIFICATE_PASSWORD: the password the .p12 was exported with.
+# - APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID: for notarizing (Apple checks the app
+#   and approves it, so Macs open it without a warning).
+# The private repo's timestack-desktop/RELEASING.md says where each one comes from.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, like 0.1.38 (empty = the one in timestack-desktop/package.json)
+        required: false
+      notes:
+        description: What's new (shown on the release page)
+        required: false
+      ref:
+        description: Branch or commit of Beshoy-Wassef/TimeStack to build
+        default: main
+        required: true
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: Beshoy-Wassef/TimeStack
+
+jobs:
+  draft:
+    name: Draft the release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref || 'main' }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: source
+          persist-credentials: false
+
+      - name: Pick the version
+        id: version
+        env:
+          INPUT: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            VER="${GITHUB_REF_NAME#v}"
+          elif [ -n "$INPUT" ]; then
+            VER="${INPUT#v}"
+          else
+            VER=$(node -p "require('./source/timestack-desktop/package.json').version")
+          fi
+          if ! echo "$VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Not a version: $VER"
+            exit 1
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git -C source rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Building TimeStack $VER from $SOURCE_REPO@$(git -C source rev-parse --short HEAD)"
+
+      - name: Make a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VER: ${{ steps.version.outputs.version }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          draft=$(gh release view "v$VER" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null || echo none)
+          if [ "$draft" = false ]; then
+            echo "::error::v$VER is already released. Bump the version in timestack-desktop/package.json first."
+            exit 1
+          fi
+          if [ "$draft" = none ]; then
+            {
+              if [ -n "$NOTES" ]; then printf '%s\n\n' "$NOTES"; fi
+              echo "**Mac:** download **TimeStack.dmg** (Apple Silicon and Intel)."
+              echo "**Windows:** download **TimeStack-Setup.exe** (Windows 10 and 11, 64-bit)."
+              echo
+              echo "Installing for the first time? See the [README](https://github.com/$GITHUB_REPOSITORY#install). If you already have TimeStack, it updates itself (0.1.37 and earlier need this download once)."
+            } > notes.md
+            gh release create "v$VER" --repo "$GITHUB_REPOSITORY" --draft --title "TimeStack $VER" --notes-file notes.md
+          fi
+
+  mac:
+    name: Mac (signed and notarized)
+    needs: draft
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      VER: ${{ needs.draft.outputs.version }}
+    defaults:
+      run:
+        working-directory: source/timestack-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.draft.outputs.sha }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: source
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Keys
+        env:
+          KEYS: ${{ secrets.TIMESTACK_ENV_LOCAL }}
+        run: |
+          if [ -n "$KEYS" ]; then
+            node -e "require('fs').writeFileSync(process.argv[1], process.env.KEYS + '\n', { mode: 0o600 })" "$RUNNER_TEMP/timestack.env"
+            echo "TIMESTACK_ENV=$RUNNER_TEMP/timestack.env" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No TIMESTACK_ENV_LOCAL secret: building in local mode."
+          fi
+
+      - run: npm ci --no-audit --no-fund
+      - run: npm version "$VER" --no-git-tag-version --allow-same-version
+      - run: node scripts/prepare-app.mjs
+
+      # Signs with the Developer ID (electron-builder puts the certificate in a temporary
+      # keychain), has Apple notarize the app and staples the ticket to it, then uploads the
+      # .dmg, the .zip that installed apps update from, and latest-mac.yml.
+      - name: Build, sign, notarize and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CSC_LINK: ${{ secrets.MAC_CERTIFICATE }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=""
+          for v in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!v}" ]; then missing="$missing $v"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing Apple secrets (CSC_LINK is MAC_CERTIFICATE, CSC_KEY_PASSWORD is MAC_CERTIFICATE_PASSWORD):$missing"
+            exit 1
+          fi
+          npx electron-builder --mac --publish always -c.forceCodeSigning=true
+
+      - name: Check the signature and notarization
+        run: |
+          app=dist/mac-universal/TimeStack.app
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv "$app" 2>&1 | grep -E "^(Authority|TeamIdentifier)=" | head -2
+          xcrun stapler validate "$app"
+          # Gatekeeper's own verdict ("source=Notarized Developer ID"); only a warning, since a
+          # build machine's Gatekeeper settings can differ from a student's Mac.
+          spctl --assess --type execute --verbose=4 "$app" || echo "::warning::Gatekeeper didn't accept the app on this machine; check the notarization log above."
+
+      - name: Upload TimeStack.dmg
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "dist/TimeStack-$VER.dmg" dist/TimeStack.dmg
+          gh release upload "v$VER" dist/TimeStack.dmg --clobber --repo "$GITHUB_REPOSITORY"
+
+  windows:
+    name: Windows (installer)
+    needs: draft
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      VER: ${{ needs.draft.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: source/timestack-desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.draft.outputs.sha }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: source
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Keys
+        env:
+          KEYS: ${{ secrets.TIMESTACK_ENV_LOCAL }}
+        run: |
+          if [ -n "$KEYS" ]; then
+            node -e "require('fs').writeFileSync(process.argv[1], process.env.KEYS + '\n')" "$RUNNER_TEMP/timestack.env"
+            echo "TIMESTACK_ENV=$RUNNER_TEMP/timestack.env" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No TIMESTACK_ENV_LOCAL secret: building in local mode."
+          fi
+
+      - run: npm ci --no-audit --no-fund
+      - run: npm version "$VER" --no-git-tag-version --allow-same-version
+      - run: node scripts/prepare-app.mjs --win
+
+      - name: Build and upload the installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: npx electron-builder --win --x64 -c.extraMetadata.description=TimeStack --publish always
+
+      - name: Upload TimeStack-Setup.exe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "dist/TimeStack-Setup-$VER.exe" dist/TimeStack-Setup.exe
+          gh release upload "v$VER" dist/TimeStack-Setup.exe --clobber --repo "$GITHUB_REPOSITORY"
+
+  publish:
+    name: Publish the release
+    needs: [draft, mac, windows]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VER: ${{ needs.draft.outputs.version }}
+    steps:
+      - name: Check every file is there, then publish
+        run: |
+          have=$(gh release view "v$VER" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+          for f in "TimeStack-$VER.dmg" TimeStack.dmg "TimeStack-$VER-mac.zip" latest-mac.yml "TimeStack-Setup-$VER.exe" "TimeStack-Setup-$VER.exe.blockmap" TimeStack-Setup.exe latest.yml; do
+            if ! echo "$have" | grep -qxF "$f"; then
+              echo "::error::The release is missing $f"
+              exit 1
+            fi
+          done
+          gh release edit "v$VER" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/v$VER"
