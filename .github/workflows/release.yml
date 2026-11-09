@@ -1,16 +1,6 @@
 name: Release
 
-# Builds TimeStack for Mac and Windows from its private source (Beshoy-Wassef/TimeStack),
-# signs the Mac app with the Developer ID certificate and has Apple notarize it, and posts both
-# here as a GitHub Release. Installed apps read the newest release to update themselves:
-# Windows reads latest.yml, the Mac reads latest-mac.yml.
-#
-# Run it from the Actions tab (Release, then Run workflow). It builds the version in the
-# source's timestack-desktop/package.json unless you type another one. Pushing a tag like
-# v0.1.38 runs it too.
-#
-# Secrets (Settings > Secrets and variables > Actions):
-# The private repo's timestack-desktop/RELEASING.md says where each one comes from.
+
 
 on:
   workflow_dispatch:
