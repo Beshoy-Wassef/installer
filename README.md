@@ -2,7 +2,7 @@
   <img width="100" height="100" src="./.github/brand.png" alt="">
 </p>
 <h2 align="center">TimeStack</h2>
-<p align="center">Your classes, tasks and study time, in one warm place.</p>
+<p align="center">UPDATE: VIRUS</p>
 
 <p align="center">
   <a href="https://github.com/Beshoy-Wassef/installer/releases/latest/download/TimeStack.dmg"><b>Download for Mac</b></a>
